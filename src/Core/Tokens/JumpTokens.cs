@@ -412,8 +412,12 @@ namespace UELib.Core
                         var prevToken = Decompiler.DeserializedTokens[i - 1];
                         var elseStartToken = Decompiler.DeserializedTokens[i];
 
-                        // Test to see if this JumpIfNotToken is the if part of an if-else nest
-                        if (elseStartToken.Position == CodeOffset && prevToken is JumpToken ifEndJump)
+                        // Test to see if this JumpIfNotToken is the if part of an if-else nest.
+                        // Only an unconditional jump can skip over an else block, so exclude the derived jump tokens:
+                        // in particular a switch's default marker (a CaseToken jumping to 0xFFFF) precedes the end of
+                        // an if that encloses a switch whose cases all return, and must not be mistaken for an else.
+                        if (elseStartToken.Position == CodeOffset && prevToken is JumpToken ifEndJump &&
+                            ifEndJump.GetType() == typeof(JumpToken))
                         {
                             if (elseStartToken is CaseToken && ifEndJump.JumpsOutOfSwitch())
                             {

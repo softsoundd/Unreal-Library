@@ -56,33 +56,94 @@ namespace UELib.Core
                     }
                 }
 
-                private static string PrecedenceToken(Token t, byte parentPrecedence)
+                /// <summary>
+                /// Tokens that decompile transparently to the expression that follows them, and may therefore sit
+                /// between an operator and one of its operands. The most important one is the <see cref="SkipToken"/>
+                /// that precedes the "skip" parameter of the short-circuiting operators (&amp;&amp; and ||).
+                /// </summary>
+                [MethodImpl(MethodImplOptions.AggressiveInlining)]
+                private static bool IsTransparentOperandWrapper(Token t)
                 {
-                    if (!(t is FunctionToken))
+                    return t is SkipToken
+                           || t is ResizeStringToken
+                           || t is LineNumberToken;
+                }
+
+                /// <summary>
+                /// Resolves the token that actually forms an operand's expression by looking through any transparent
+                /// wrapper tokens, so that the operand's operator precedence can be inspected.
+                ///
+                /// This does not advance the decompiler; the wrapper token itself must still be the one that gets decompiled.
+                /// </summary>
+                private Token ResolveOperandToken(Token t)
+                {
+                    var tokens = Decompiler.DeserializedTokens;
+                    int index = tokens.IndexOf(t);
+                    if (index == -1)
+                        return t;
+
+                    while (IsTransparentOperandWrapper(t))
+                    {
+                        do
+                        {
+                            if (++index >= tokens.Count)
+                                return t;
+                        } while (tokens[index] is DebugInfoToken);
+
+                        t = tokens[index];
+                    }
+
+                    return t;
+                }
+
+                /// <param name="isRightOperand">
+                /// UnrealScript binds operators of equal precedence from left to right: the compiler only nests an
+                /// operator into a right-hand operand when its precedence is strictly lower (see
+                /// <c>FScriptCompiler::CompileExpr</c>). A right-hand operand of equal precedence can therefore only
+                /// have come from explicit parentheses in the source, and must be parenthesized again to preserve the
+                /// expression tree; a left-hand operand of equal precedence must not be.
+                /// </param>
+                private string PrecedenceToken(Token t, byte parentPrecedence, bool isRightOperand = false)
+                {
+                    var operand = ResolveOperandToken(t);
+                    if (!(operand is FunctionToken))
                         return t.Decompile();
 
-                    byte childPrecedence = GetInfixOperPrecedence(t);
+                    byte childPrecedence = GetInfixOperPrecedence(operand);
                     if (childPrecedence == 0)
                         return t.Decompile();
 
-                    return childPrecedence > parentPrecedence
+                    bool needsParentheses = isRightOperand
+                        ? childPrecedence >= parentPrecedence
+                        : childPrecedence > parentPrecedence;
+
+                    return needsParentheses
                         ? $"({t.Decompile()})"
                         : t.Decompile();
                 }
 
-                private static bool UnaryOperandNeedsParentheses(Token t)
+                /// <summary>
+                /// A unary operator binds tighter than any infix operator, so an infix operand must be parenthesized
+                /// (e.g. <c>!(A || B)</c>). A function call is self-delimiting and never needs them (<c>!IsA('Foo')</c>).
+                ///
+                /// A nested pre-operator only needs them when writing the two operators back to back would lex as a
+                /// different token: <c>-(-A)</c> must not become <c>--A</c> (a pre-decrement).
+                /// </summary>
+                private static bool UnaryOperandNeedsParentheses(Token t, string operatorName)
                 {
                     return t switch
                     {
-                        NativeFunctionToken { NativeItem.Type: FunctionType.Operator or FunctionType.Function } => true,
+                        NativeFunctionToken { NativeItem.Type: FunctionType.Operator } => true,
+                        NativeFunctionToken { NativeItem.Type: FunctionType.PreOperator } inner
+                            when operatorName == "-" && inner.NativeItem.Name == operatorName => true,
                         FinalFunctionToken { Function: var function } when function.IsOperator() => true,
                         _ => GetInfixOperPrecedence(t) > 0
                     };
                 }
 
-                private static string DecompileUnaryOperand(Token t)
+                private string DecompileUnaryOperand(Token t, string operatorName)
                 {
-                    return UnaryOperandNeedsParentheses(t)
+                    return UnaryOperandNeedsParentheses(t, operatorName)
                         ? $"({t.Decompile()})"
                         : PrecedenceToken(t, 0);
                 }
@@ -97,7 +158,7 @@ namespace UELib.Core
                 protected string DecompilePreOperator(string operatorName)
                 {
                     var operandToken = NextToken();
-                    string operand = DecompileUnaryOperand(operandToken);
+                    string operand = DecompileUnaryOperand(operandToken, operatorName);
                     AssertSkipCurrentToken<EndFunctionParmsToken>();
 
                     // Only space out if we have a non-symbol operator name.
@@ -108,16 +169,16 @@ namespace UELib.Core
 
                 protected string DecompileOperator(string operatorName, byte operPrecedence = byte.MaxValue)
                 {
-                    var output =
-                        $"{PrecedenceToken(NextToken(), operPrecedence)} {operatorName} {PrecedenceToken(NextToken(), operPrecedence)}";
+                    string leftOperand = PrecedenceToken(NextToken(), operPrecedence);
+                    string rightOperand = PrecedenceToken(NextToken(), operPrecedence, isRightOperand: true);
                     AssertSkipCurrentToken<EndFunctionParmsToken>();
-                    return output;
+                    return $"{leftOperand} {operatorName} {rightOperand}";
                 }
 
                 protected string DecompilePostOperator(string operatorName)
                 {
                     var operandToken = NextToken();
-                    string operand = DecompileUnaryOperand(operandToken);
+                    string operand = DecompileUnaryOperand(operandToken, operatorName);
                     AssertSkipCurrentToken<EndFunctionParmsToken>();
 
                     // Only space out if we have a non-symbol operator name.

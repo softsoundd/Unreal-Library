@@ -298,6 +298,10 @@ namespace UELib.Core
         public bool Deserialize()
         {
             _TagPosition = _Buffer.Position;
+            // Only some tag types carry type data, so clear what a previous tag left behind: this instance is reused
+            // for consecutive tags (see the struct deserialization), and a stale struct name would be mistaken for
+            // the inner type name of a following array tag.
+            _TypeData = default;
             if (DeserializeNextTag())
             {
                 return false;
@@ -871,9 +875,17 @@ namespace UELib.Core
 
                         if (UStructProperty.PropertyValueSerializer.CanSerializeStructUsingBinary(_Buffer))
                         {
+                            // An array tag carries no struct name for its elements (prior to UE4), so for an array
+                            // element fall back to the array's resolved inner struct (see FindProperty). Otherwise an
+                            // atomic element type such as 'Color' would fall through to the tagged deserialization
+                            // below and read its raw bytes as a property tag.
+                            string structName = _TypeData.StructName != null
+                                ? (string)_TypeData.StructName
+                                : propertySource?.Name;
+
                             // Some structs are serialized using tags.
                             // Let's find out if this is one of them.
-                            Enum.TryParse(_TypeData.StructName,
+                            Enum.TryParse(structName,
                                 out UStructProperty.PropertyValueSerializer.BinaryStructType binaryStructType);
                             if (UStructProperty.PropertyValueSerializer.IsStructImmutable(
                                     _Buffer,
@@ -928,6 +940,7 @@ namespace UELib.Core
                     {
                         int arraySize = _Buffer.ReadIndex();
                         Record(nameof(arraySize), arraySize);
+                        long elementsPosition = _Buffer.Position;
                         if (arraySize == 0)
                         {
                             propertyValue = "none";
@@ -980,12 +993,32 @@ namespace UELib.Core
                             break;
                         }
 
+                        // UE3 serializes an enum-typed byte as the name of its enum tag (an FName) rather than as a raw
+                        // byte, and does so for dynamic array elements too (see UByteProperty::SerializeItem). The array
+                        // tag doesn't record whether its byte elements are enums, so infer it from the element size:
+                        // an FName occupies 8 bytes, a plain byte 1.
+                        bool areEnumTagElements = arrayType == PropertyType.ByteProperty
+                                                  && _Buffer.Version >= (uint)PackageObjectLegacyVersion.EnumTagNameAddedToBytePropertyTag
+                                                  && _PropertyValuePosition + Size - elementsPosition == arraySize * 8L;
+
+                        string DeserializeElement()
+                        {
+                            if (!areEnumTagElements)
+                            {
+                                return LegacyDeserializeDefaultPropertyValue(arrayType, deserializeFlags);
+                            }
+
+                            string enumTagName = _Buffer.ReadName();
+                            Record(nameof(enumTagName), enumTagName);
+                            return enumTagName;
+                        }
+
                         deserializeFlags |= DeserializeFlags.WithinArray;
                         if ((deserializeFlags & DeserializeFlags.WithinStruct) != 0)
                         {
                             for (var i = 0; i < arraySize; ++i)
                             {
-                                propertyValue += LegacyDeserializeDefaultPropertyValue(arrayType, deserializeFlags)
+                                propertyValue += DeserializeElement()
                                                  + (i != arraySize - 1 ? "," : string.Empty);
                             }
 
@@ -997,8 +1030,7 @@ namespace UELib.Core
                             {
                                 string elementAccessText =
                                     PropertyDisplay.FormatT3DElementAccess(i.ToString(), _Buffer.Version);
-                                string elementValue =
-                                    LegacyDeserializeDefaultPropertyValue(arrayType, deserializeFlags);
+                                string elementValue = DeserializeElement();
                                 if ((_TempFlags & ReplaceNameMarker) != 0)
                                 {
                                     propertyValue += elementValue.Replace("%ARRAYNAME%", $"{Name}{elementAccessText}");
